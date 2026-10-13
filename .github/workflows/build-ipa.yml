@@ -9,6 +9,8 @@ jobs:
   build:
     runs-on: macos-14
     steps:
+      - uses: actions/checkout@v4
+
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_15.4.app
 
@@ -548,7 +550,7 @@ jobs:
       # Sideload the resulting IPA via Sideloadly or AltStore, which
       # sign it with your own Apple ID for free.
       # ──────────────────────────────────────────────────────────────
-      - name: Build (unsigned)
+      - name: Build (unsigned, ad-hoc signed)
         run: |
           xcodebuild \
             -project DuoSpaceMood.xcodeproj \
@@ -556,17 +558,25 @@ jobs:
             -configuration Release \
             -sdk iphoneos \
             -derivedDataPath build \
-            -archivePath build/DuoSpaceMood.xcarchive \
-            archive \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            DEVELOPMENT_TEAM=""
+            build \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=YES \
+            CODE_SIGNING_ALLOWED=YES \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
 
       - name: Package unsigned IPA
         run: |
+          APP_PATH=$(find build/Build/Products -name "DuoSpaceMood.app" -type d | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "DuoSpaceMood.app not found in build products"
+            find build/Build/Products -type d -name "*.app" || true
+            exit 1
+          fi
+          echo "Found app at: $APP_PATH"
           mkdir -p build/ipa/Payload
-          cp -r build/DuoSpaceMood.xcarchive/Products/Applications/DuoSpaceMood.app build/ipa/Payload/
+          cp -r "$APP_PATH" build/ipa/Payload/
           cd build/ipa
           zip -r DuoSpaceMood-unsigned.ipa Payload
 
