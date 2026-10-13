@@ -2,15 +2,10 @@ name: Build APK
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: src/native/android
 
     steps:
       - uses: actions/checkout@v4
@@ -24,6 +19,576 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
+      - name: Create Android project
+        run: |
+          mkdir -p app/src/main/java/com/duospace/mood
+          mkdir -p app/src/main/res/layout
+          mkdir -p app/src/main/res/xml
+          mkdir -p app/src/main/res/values
+          mkdir -p app/src/main/res/drawable
+          mkdir -p app/src/main/res/mipmap-anydpi-v26
+
+          cat << 'EOF' > settings.gradle
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "DuoSpace"
+          include ':app'
+          EOF
+
+          cat << 'EOF' > build.gradle
+          plugins {
+              id 'com.android.application' version '8.2.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
+          }
+          EOF
+
+          cat << 'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat << 'EOF' > app/build.gradle
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+
+          android {
+              namespace 'com.duospace.mood'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.duospace.mood"
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+
+          dependencies {
+              implementation 'androidx.appcompat:appcompat:1.6.1'
+              implementation 'com.google.code.gson:gson:2.10.1'
+              implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+              implementation 'androidx.work:work-runtime-ktx:2.9.0'
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.AppCompat.NoActionBar"
+                  android:usesCleartextTraffic="false">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <receiver
+                      android:name=".MoodWidgetProvider"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.appwidget.provider"
+                          android:resource="@xml/mood_widget_info" />
+                  </receiver>
+                  <receiver
+                      android:name=".MoodWidgetRefreshReceiver"
+                      android:exported="false">
+                      <intent-filter>
+                          <action android:name="com.duospace.mood.REFRESH_WIDGET" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/duospace/mood/MainActivity.kt
+          package com.duospace.mood
+
+          import android.annotation.SuppressLint
+          import android.os.Bundle
+          import android.view.KeyEvent
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebSettings
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.work.ExistingPeriodicWorkPolicy
+          import androidx.work.PeriodicWorkRequestBuilder
+          import androidx.work.WorkManager
+          import java.util.concurrent.TimeUnit
+
+          class MainActivity : AppCompatActivity() {
+              private lateinit var webView: WebView
+
+              @SuppressLint("SetJavaScriptEnabled")
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  webView = WebView(this)
+                  setContentView(webView)
+                  webView.settings.apply {
+                      javaScriptEnabled = true
+                      domStorageEnabled = true
+                      databaseEnabled = true
+                      cacheMode = WebSettings.LOAD_DEFAULT
+                      setSupportZoom(false)
+                      displayZoomControls = false
+                      mediaPlaybackRequiresUserGesture = false
+                      javaScriptCanOpenWindowsAutomatically = true
+                  }
+                  webView.addJavascriptInterface(TokenBridge(this), "AndroidTokenBridge")
+                  webView.webViewClient = object : WebViewClient() {
+                      override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                          return false
+                      }
+                      override fun onPageFinished(view: WebView?, url: String?) {
+                          view?.evaluateJavascript(
+                              "(function(){var t=localStorage.getItem('base44_access_token');if(t)AndroidTokenBridge.syncToken(t);})();",
+                              null
+                          )
+                      }
+                  }
+                  webView.loadUrl("https://nemo39.base44.app")
+                  scheduleWidgetRefresh()
+                  }
+                  }
+
+          private fun scheduleWidgetRefresh() {
+              val request = PeriodicWorkRequestBuilder<MoodRefreshWorker>(15, TimeUnit.MINUTES)
+                  .build()
+              WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+                  "mood_widget_refresh",
+                  ExistingPeriodicWorkPolicy.UPDATE,
+                  request
+              )
+          }
+
+          override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+                  if (keyCode == KeyEvent.KEYCODE_BACK && webView.canGoBack()) {
+                      webView.goBack()
+                      return true
+                  }
+                  return super.onKeyDown(keyCode, event)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  webView.evaluateJavascript(
+                      "(function(){var t=localStorage.getItem('base44_access_token');if(t)AndroidTokenBridge.syncToken(t);})();",
+                      null
+                  )
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/duospace/mood/MoodEntry.kt
+          package com.duospace.mood
+
+          import com.google.gson.annotations.SerializedName
+
+          data class MoodResponse(
+              val mood: MoodData?,
+              val partner: PartnerData,
+              val error: String?
+          )
+
+          data class MoodData(
+              val id: String,
+              val emoji: String,
+              val label: String,
+              val color: String,
+              val note: String?,
+              @SerializedName("created_date") val createdDate: String?
+          )
+
+          data class PartnerData(
+              val name: String,
+              @SerializedName("avatar_url") val avatarUrl: String?
+          )
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/duospace/mood/TokenBridge.kt
+          package com.duospace.mood
+
+          import android.content.Context
+          import android.content.Intent
+          import android.webkit.JavascriptInterface
+
+          class TokenBridge(private val context: Context) {
+              @JavascriptInterface
+              fun syncToken(token: String) {
+                  if (token.isEmpty()) return
+                  context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                      .edit()
+                      .putString(KEY_TOKEN, token)
+                      .apply()
+                  context.sendBroadcast(Intent(ACTION_REFRESH_WIDGET).setPackage(context.packageName))
+              }
+
+              @JavascriptInterface
+              fun refreshWidget() {
+                  context.sendBroadcast(Intent(ACTION_REFRESH_WIDGET).setPackage(context.packageName))
+              }
+
+              companion object {
+                  const val PREFS_NAME = "duospace_mood_prefs"
+                  const val KEY_TOKEN = "base44_access_token"
+                  const val ACTION_REFRESH_WIDGET = "com.duospace.mood.REFRESH_WIDGET"
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/duospace/mood/MoodWidgetRefreshReceiver.kt
+          package com.duospace.mood
+
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+
+          class MoodWidgetRefreshReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent) {
+                  MoodWidgetProvider.refreshAll(context)
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/duospace/mood/MoodRefreshWorker.kt
+          package com.duospace.mood
+
+          import android.content.Context
+          import androidx.work.CoroutineWorker
+          import androidx.work.WorkerParameters
+
+          class MoodRefreshWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
+              override suspend fun doWork(): Result {
+                  return try {
+                      MoodWidgetProvider.refreshAllSync(applicationContext)
+                      Result.success()
+                  } catch (e: Exception) {
+                      Result.retry()
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/duospace/mood/MoodWidgetProvider.kt
+          package com.duospace.mood
+
+          import android.app.PendingIntent
+          import android.appwidget.AppWidgetManager
+          import android.appwidget.AppWidgetProvider
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.widget.RemoteViews
+          import com.google.gson.Gson
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          class MoodWidgetProvider : AppWidgetProvider() {
+              override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
+                  appWidgetIds.forEach { id -> updateWidget(context, appWidgetManager, id, null) }
+                  CoroutineScope(Dispatchers.IO).launch {
+                      val mood = fetchMood(context)
+                      appWidgetIds.forEach { id -> updateWidget(context, appWidgetManager, id, mood) }
+                  }
+              }
+
+              override fun onAppWidgetOptionsChanged(
+                  context: Context, appWidgetManager: AppWidgetManager, appWidgetId: Int, newOptions: Bundle
+              ) {
+                  CoroutineScope(Dispatchers.IO).launch {
+                      val mood = fetchMood(context)
+                      updateWidget(context, appWidgetManager, appWidgetId, mood)
+                  }
+              }
+
+              companion object {
+                  private const val PREFS = "duospace_mood_prefs"
+                  private const val KEY_TOKEN = "base44_access_token"
+                  private const val KEY_CACHED_MOOD = "cached_mood_json"
+
+                  fun fetchMood(context: Context): MoodResponse? {
+                      return try {
+                          val token = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                              .getString(KEY_TOKEN, "") ?: ""
+                          if (token.isEmpty()) return MoodResponse(null, PartnerData("Partner", null), null)
+                          val url = URL("https://nemo39.base44.app/functions/getPartnerMood")
+                          val conn = (url.openConnection() as HttpURLConnection).apply {
+                              requestMethod = "POST"
+                              setRequestProperty("Authorization", "Bearer $token")
+                              setRequestProperty("Content-Type", "application/json")
+                              connectTimeout = 10000
+                              readTimeout = 10000
+                          }
+                          val body = conn.inputStream.bufferedReader().use { it.readText() }
+                          val response = Gson().fromJson(body, MoodResponse::class.java)
+                          context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                              .edit().putString(KEY_CACHED_MOOD, body).apply()
+                          response
+                      } catch (e: Exception) {
+                          val cached = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                              .getString(KEY_CACHED_MOOD, null)
+                          if (cached != null) {
+                              try { Gson().fromJson(cached, MoodResponse::class.java) }
+                              catch (_: Exception) { null }
+                          } else null
+                      }
+                  }
+
+                  fun updateWidget(
+                      context: Context, appWidgetManager: AppWidgetManager, appWidgetId: Int, mood: MoodResponse?
+                  ) {
+                      val views = RemoteViews(context.packageName, R.layout.mood_widget)
+                      val data = mood ?: run {
+                          context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                              .getString(KEY_CACHED_MOOD, null)?.let {
+                                  try { Gson().fromJson(it, MoodResponse::class.java) } catch (_: Exception) { null }
+                              }
+                      }
+                      val moodData = data?.mood
+                      val partnerName = data?.partner?.name ?: "Partner"
+                      if (moodData != null) {
+                          val bgColor = parseColor(moodData.color, 0xFF1C1917.toInt())
+                          views.setInt(R.id.widget_root, "setBackgroundColor", bgColor)
+                          views.setTextViewText(R.id.emoji, moodData.emoji)
+                          views.setTextViewText(R.id.label, moodData.label)
+                          views.setTextViewText(R.id.partner_name, partnerName.uppercase())
+                          views.setTextViewText(R.id.time_ago, timeAgo(moodData.createdDate))
+                          views.setTextViewText(R.id.note, moodData.note ?: "")
+                          views.setViewVisibility(R.id.note,
+                              if (moodData.note.isNullOrEmpty()) android.view.View.GONE else android.view.View.VISIBLE)
+                      } else {
+                          views.setInt(R.id.widget_root, "setBackgroundColor", 0xFF1C1917.toInt())
+                          views.setTextViewText(R.id.emoji, "💭")
+                          views.setTextViewText(R.id.label, "No mood yet")
+                          views.setTextViewText(R.id.partner_name, partnerName.uppercase())
+                          views.setTextViewText(R.id.time_ago, "")
+                          views.setViewVisibility(R.id.note, android.view.View.GONE)
+                      }
+                      val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://nemo39.base44.app/mood-widget"))
+                          .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      val pi = PendingIntent.getActivity(
+                          context, appWidgetId, intent,
+                          PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                      )
+                      views.setOnClickPendingIntent(R.id.widget_root, pi)
+                      appWidgetManager.updateAppWidget(appWidgetId, views)
+                  }
+
+                  fun refreshAll(context: Context) {
+                      val mgr = AppWidgetManager.getInstance(context)
+                      val ids = mgr.getAppWidgetIds(ComponentName(context, MoodWidgetProvider::class.java))
+                      CoroutineScope(Dispatchers.IO).launch {
+                          val mood = fetchMood(context)
+                          ids.forEach { updateWidget(context, mgr, it, mood) }
+                      }
+                  }
+
+                  fun refreshAllSync(context: Context) {
+                      val mgr = AppWidgetManager.getInstance(context)
+                      val ids = mgr.getAppWidgetIds(ComponentName(context, MoodWidgetProvider::class.java))
+                      val mood = fetchMood(context)
+                      ids.forEach { updateWidget(context, mgr, it, mood) }
+                  }
+
+                  private fun parseColor(hex: String, fallback: Int): Int {
+                      return try {
+                          val cleaned = hex.removePrefix("#")
+                          android.graphics.Color.parseColor("#$cleaned")
+                      } catch (_: Exception) { fallback }
+                  }
+
+                  private fun timeAgo(isoDate: String?): String {
+                      if (isoDate == null) return ""
+                      return try {
+                          val sdf = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", java.util.Locale.US)
+                          sdf.timeZone = java.util.TimeZone.getTimeZone("UTC")
+                          val date = sdf.parse(isoDate) ?: return ""
+                          val diff = (System.currentTimeMillis() - date.time) / 1000
+                          when {
+                              diff < 60 -> "just now"
+                              diff < 3600 -> "${diff / 60}m ago"
+                              diff < 86400 -> "${diff / 3600}h ago"
+                              else -> "${diff / 86400}d ago"
+                          }
+                      } catch (_: Exception) { "" }
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/res/layout/mood_widget.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/widget_root"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="#1C1917"
+              android:padding="12dp">
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="match_parent"
+                  android:orientation="vertical"
+                  android:gravity="center"
+                  android:layout_gravity="center">
+                  <TextView
+                      android:id="@+id/partner_name"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:text="PARTNER"
+                      android:textColor="#B3FFFFFF"
+                      android:textSize="11sp"
+                      android:textAllCaps="true"
+                      android:letterSpacing="0.08"
+                      android:layout_marginBottom="6dp" />
+                  <TextView
+                      android:id="@+id/emoji"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:text="💭"
+                      android:textSize="40sp"
+                      android:layout_marginBottom="4dp" />
+                  <TextView
+                      android:id="@+id/label"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:text="No mood yet"
+                      android:textColor="#FFFFFF"
+                      android:textSize="16sp"
+                      android:textStyle="bold"
+                      android:maxLines="1"
+                      android:ellipsize="end" />
+                  <TextView
+                      android:id="@+id/note"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:textColor="#CCFFFFFF"
+                      android:textSize="12sp"
+                      android:maxLines="2"
+                      android:ellipsize="end"
+                      android:gravity="center"
+                      android:layout_marginTop="6dp"
+                      android:layout_marginStart="4dp"
+                      android:layout_marginEnd="4dp"
+                      android:visibility="gone" />
+                  <TextView
+                      android:id="@+id/time_ago"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:textColor="#99FFFFFF"
+                      android:textSize="11sp"
+                      android:layout_marginTop="4dp" />
+              </LinearLayout>
+          </FrameLayout>
+          EOF
+
+          cat << 'EOF' > app/src/main/res/xml/mood_widget_info.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+              android:initialLayout="@layout/mood_widget"
+              android:minWidth="110dp"
+              android:minHeight="110dp"
+              android:minResizeWidth="110dp"
+              android:minResizeHeight="110dp"
+              android:maxResizeWidth="250dp"
+              android:maxResizeHeight="250dp"
+              android:targetCellWidth="2"
+              android:targetCellHeight="2"
+              android:resizeMode="horizontal|vertical"
+              android:updatePeriodMillis="900000"
+              android:widgetCategory="home_screen"
+              android:previewLayout="@layout/mood_widget"
+              android:description="@string/widget_description" />
+          EOF
+
+          cat << 'EOF' > app/src/main/res/values/strings.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">DuoSpace</string>
+              <string name="widget_description">See your partner\'s current mood at a glance.</string>
+          </resources>
+          EOF
+
+          cat << 'EOF' > app/src/main/res/values/colors.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_launcher_background">#F43F5E</color>
+          </resources>
+          EOF
+
+          cat << 'EOF' > app/src/main/res/drawable/ic_launcher_foreground.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M54,30 C40,30 29,41 29,55 C29,69 40,80 54,80 C68,80 79,69 79,55 C79,41 68,30 54,30 Z M44,50 C47,50 49,52 49,55 C49,58 47,60 44,60 C41,60 39,58 39,55 C39,52 41,50 44,50 Z M64,50 C67,50 69,52 69,55 C69,58 67,60 64,60 C61,60 59,58 59,55 C59,52 61,50 64,50 Z" />
+          </vector>
+          EOF
+
+          cat << 'EOF' > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          EOF
+
+          cp app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml
+
       - name: Generate Gradle wrapper
         run: gradle wrapper --gradle-version 8.5
 
@@ -34,5 +599,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: duospace-debug-apk
-          path: src/native/android/app/build/outputs/apk/debug/app-debug.apk
+          path: app/build/outputs/apk/debug/app-debug.apk
           retention-days: 30
