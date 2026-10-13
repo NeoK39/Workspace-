@@ -551,11 +551,12 @@ jobs:
         run: xcodegen generate
 
       # ──────────────────────────────────────────────────────────────
-      # UNSIGNED BUILD (default — no Apple Developer account needed)
-      # Sideload the resulting IPA via Sideloadly or AltStore, which
-      # sign it with your own Apple ID for free.
+      # UNSIGNED RELEASE BUILD (no Apple Developer account needed)
+      # Builds an optimized Release .app with no code signing, then
+      # packages it as an unsigned IPA. Sideload via Sideloadly or
+      # AltStore, which sign it with your own Apple ID for free.
       # ──────────────────────────────────────────────────────────────
-      - name: Build (unsigned, ad-hoc signed)
+      - name: Build (unsigned, release-optimized)
         run: |
           xcodebuild \
             -project DuoSpaceMood.xcodeproj \
@@ -564,12 +565,11 @@ jobs:
             -sdk iphoneos \
             -derivedDataPath build \
             build \
-            CODE_SIGN_IDENTITY="-" \
-            CODE_SIGNING_REQUIRED=YES \
-            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
             DEVELOPMENT_TEAM="" \
-            PROVISIONING_PROFILE_SPECIFIER="" \
-            AD_HOC_CODE_SIGNING_ALLOWED=YES
+            PROVISIONING_PROFILE_SPECIFIER=""
 
       - name: Package unsigned IPA
         run: |
