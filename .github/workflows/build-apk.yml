@@ -592,12 +592,12 @@ jobs:
       - name: Generate Gradle wrapper
         run: gradle wrapper --gradle-version 8.5
 
-      - name: Build debug APK
-        run: ./gradlew assembleDebug --no-daemon
+      - name: Build release APK (unsigned)
+        run: ./gradlew assembleRelease --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: duospace-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: duospace-release-apk
+          path: app/build/outputs/apk/release/app-release-unsigned.apk
           retention-days: 30
