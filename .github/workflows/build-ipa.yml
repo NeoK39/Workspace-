@@ -1,0 +1,659 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      # ──────────────────────────────────────────────────────────────
+      # Generate all source files inline — no need to copy anything
+      # else to your repo. This single workflow file IS the entire
+      # iOS project definition.
+      # ──────────────────────────────────────────────────────────────
+      - name: Create project.yml
+        run: |
+          cat << 'YML_EOF' > project.yml
+          name: DuoSpaceMood
+          options:
+            bundleIdPrefix: com.duospace.mood
+            deploymentTarget:
+              iOS: "16.0"
+            createIntermediateGroups: true
+          settings:
+            base:
+              SWIFT_VERSION: "5.0"
+              CODE_SIGN_STYLE: Manual
+              TARGETED_DEVICE_FAMILY: "1"
+          targets:
+            DuoSpaceMood:
+              type: application
+              platform: iOS
+              sources:
+                - path: App
+                - path: Shared
+              info:
+                path: App/Info.plist
+              entitlements:
+                path: App/DuoSpaceMood.entitlements
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.duospace.mood
+                  INFOPLIST_FILE: App/Info.plist
+                  CODE_SIGN_ENTITLEMENTS: App/DuoSpaceMood.entitlements
+                  MARKETING_VERSION: "1.0"
+                  CURRENT_PROJECT_VERSION: "1"
+              dependencies:
+                - target: DuoSpaceMoodWidget
+                  embed: true
+            DuoSpaceMoodWidget:
+              type: app-extension
+              platform: iOS
+              sources:
+                - path: Widget
+                - path: Shared
+              info:
+                path: Widget/Info.plist
+              entitlements:
+                path: Widget/DuoSpaceMoodWidget.entitlements
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.duospace.mood.widget
+                  INFOPLIST_FILE: Widget/Info.plist
+                  CODE_SIGN_ENTITLEMENTS: Widget/DuoSpaceMoodWidget.entitlements
+                  MARKETING_VERSION: "1.0"
+                  CURRENT_PROJECT_VERSION: "1"
+          YML_EOF
+
+      - name: Create Shared sources
+        run: |
+          mkdir -p Shared
+          cat << 'SWIFT_EOF' > Shared/AppGroupConfig.swift
+          import Foundation
+
+          struct AppGroupConfig {
+              static let groupIdentifier = "group.com.duospace.mood"
+              static let tokenKey = "base44_access_token"
+              static let cachedMoodKey = "cached_mood_json"
+          }
+          SWIFT_EOF
+
+          cat << 'SWIFT_EOF' > Shared/MoodEntry.swift
+          import Foundation
+
+          struct MoodResponse: Codable {
+              let mood: MoodData?
+              let partner: PartnerData
+              let error: String?
+          }
+
+          struct MoodData: Codable {
+              let id: String
+              let emoji: String
+              let label: String
+              let color: String
+              let note: String?
+              let createdDate: String?
+
+              enum CodingKeys: String, CodingKey {
+                  case id, emoji, label, color, note
+                  case createdDate = "created_date"
+              }
+
+              var timeAgoString: String? {
+                  guard let createdDate = createdDate else { return nil }
+                  let formatter = ISO8601DateFormatter()
+                  formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                  var date = formatter.date(from: createdDate)
+                  if date == nil {
+                      let f = ISO8601DateFormatter()
+                      date = f.date(from: createdDate)
+                  }
+                  guard let d = date else { return nil }
+                  let diff = Date().timeIntervalSince(d)
+                  if diff < 60 { return "just now" }
+                  if diff < 3600 { return "\(Int(diff / 60))m ago" }
+                  if diff < 86400 { return "\(Int(diff / 3600))h ago" }
+                  return "\(Int(diff / 86400))d ago"
+              }
+          }
+
+          struct PartnerData: Codable {
+              let name: String
+              let avatarUrl: String?
+
+              enum CodingKeys: String, CodingKey {
+                  case name
+                  case avatarUrl = "avatar_url"
+              }
+          }
+          SWIFT_EOF
+
+          cat << 'SWIFT_EOF' > Shared/MoodFetcher.swift
+          import Foundation
+
+          class MoodFetcher {
+              static let shared = MoodFetcher()
+
+              private let endpoint = URL(string: "https://nemo39.base44.app/functions/getPartnerMood")!
+
+              func fetchMood(token: String?) async -> MoodResponse? {
+                  guard let token = token, !token.isEmpty else {
+                      return MoodResponse(mood: nil, partner: PartnerData(name: "Partner", avatarUrl: nil), error: nil)
+                  }
+
+                  var request = URLRequest(url: endpoint)
+                  request.httpMethod = "POST"
+                  request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+                  request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                  request.timeoutInterval = 10
+
+                  do {
+                      let (data, _) = try await URLSession.shared.data(for: request)
+                      let response = try JSONDecoder().decode(MoodResponse.self, from: data)
+                      cacheMood(response)
+                      return response
+                  } catch {
+                      return getCachedMood()
+                  }
+              }
+
+              private func cacheMood(_ response: MoodResponse) {
+                  let defaults = UserDefaults(suiteName: AppGroupConfig.groupIdentifier)
+                  if let data = try? JSONEncoder().encode(response) {
+                      defaults?.set(data, forKey: AppGroupConfig.cachedMoodKey)
+                  }
+              }
+
+              func getCachedMood() -> MoodResponse? {
+                  let defaults = UserDefaults(suiteName: AppGroupConfig.groupIdentifier)
+                  guard let data = defaults?.data(forKey: AppGroupConfig.cachedMoodKey) else { return nil }
+                  return try? JSONDecoder().decode(MoodResponse.self, from: data)
+              }
+
+              func getToken() -> String? {
+                  let defaults = UserDefaults(suiteName: AppGroupConfig.groupIdentifier)
+                  return defaults?.string(forKey: AppGroupConfig.tokenKey)
+              }
+          }
+          SWIFT_EOF
+
+      - name: Create App sources
+        run: |
+          mkdir -p App
+          cat << 'SWIFT_EOF' > App/DuoSpaceMoodApp.swift
+          import SwiftUI
+          import UIKit
+
+          @main
+          struct DuoSpaceMoodApp: App {
+              var body: some Scene {
+                  WindowGroup {
+                      WebViewContainer()
+                          .ignoresSafeArea()
+                  }
+              }
+          }
+
+          struct WebViewContainer: UIViewControllerRepresentable {
+              func makeUIViewController(context: Context) -> ViewController {
+                  ViewController()
+              }
+
+              func updateUIViewController(_ uiViewController: ViewController, context: Context) {}
+          }
+          SWIFT_EOF
+
+          cat << 'SWIFT_EOF' > App/ViewController.swift
+          import UIKit
+          import WebKit
+
+          class ViewController: UIViewController {
+              private var webView: WKWebView!
+              private var tokenBridge: TokenBridge!
+
+              override func viewDidLoad() {
+                  super.viewDidLoad()
+
+                  let config = WKWebViewConfiguration()
+                  let userContentController = WKUserContentController()
+
+                  tokenBridge = TokenBridge()
+                  userContentController.add(tokenBridge, name: "tokenBridge")
+                  userContentController.add(tokenBridge, name: "widgetBridge")
+
+                  config.userContentController = userContentController
+                  config.preferences.javaScriptEnabled = true
+                  config.defaultWebpagePreferences.allowsContentJavaScript = true
+
+                  webView = WKWebView(frame: view.bounds, configuration: config)
+                  webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+                  webView.scrollView.contentInsetAdjustmentBehavior = .never
+                  webView.isOpaque = false
+                  webView.backgroundColor = .black
+                  view.addSubview(webView)
+
+                  webView.navigationDelegate = self
+                  webView.load(URLRequest(url: URL(string: "https://nemo39.base44.app")!))
+              }
+
+              override func viewWillAppear(_ animated: Bool) {
+                  super.viewWillAppear(animated)
+                  syncTokenFromStorage()
+              }
+
+              private func syncTokenFromStorage() {
+                  let js = "(function(){var t=localStorage.getItem('base44_access_token');if(t)window.webkit.messageHandlers.tokenBridge.postMessage(t);})();"
+                  webView?.evaluateJavaScript(js)
+              }
+          }
+
+          extension ViewController: WKNavigationDelegate {
+              func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+                  syncTokenFromStorage()
+              }
+          }
+          SWIFT_EOF
+
+          cat << 'SWIFT_EOF' > App/TokenBridge.swift
+          import Foundation
+          import WebKit
+          import WidgetKit
+
+          class TokenBridge: NSObject, WKScriptMessageHandler {
+              func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+                  switch message.name {
+                  case "tokenBridge":
+                      if let token = message.body as? String {
+                          syncToken(token)
+                      }
+                  case "widgetBridge":
+                      refreshWidget()
+                  default:
+                      break
+                  }
+              }
+
+              private func syncToken(_ token: String) {
+                  guard !token.isEmpty else { return }
+                  let defaults = UserDefaults(suiteName: AppGroupConfig.groupIdentifier)
+                  defaults?.set(token, forKey: AppGroupConfig.tokenKey)
+                  defaults?.synchronize()
+                  WidgetCenter.shared.reloadAllTimelines()
+              }
+
+              func refreshWidget() {
+                  WidgetCenter.shared.reloadAllTimelines()
+              }
+          }
+          SWIFT_EOF
+
+          cat << 'PLIST_EOF' > App/Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleDevelopmentRegion</key>
+              <string>en</string>
+              <key>CFBundleDisplayName</key>
+              <string>M&amp;N</string>
+              <key>CFBundleExecutable</key>
+              <string>$(EXECUTABLE_NAME)</string>
+              <key>CFBundleIdentifier</key>
+              <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+              <key>CFBundleInfoDictionaryVersion</key>
+              <string>6.0</string>
+              <key>CFBundleName</key>
+              <string>$(PRODUCT_NAME)</string>
+              <key>CFBundlePackageType</key>
+              <string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+              <key>CFBundleShortVersionString</key>
+              <string>1.0</string>
+              <key>CFBundleVersion</key>
+              <string>1</string>
+              <key>LSRequiresIPhoneOS</key>
+              <true/>
+              <key>UILaunchScreen</key>
+              <dict/>
+              <key>UISupportedInterfaceOrientations</key>
+              <array>
+                  <string>UIInterfaceOrientationPortrait</string>
+              </array>
+              <key>UISupportedInterfaceOrientations~ipad</key>
+              <array>
+                  <string>UIInterfaceOrientationPortrait</string>
+                  <string>UIInterfaceOrientationPortraitUpsideDown</string>
+                  <string>UIInterfaceOrientationLandscapeLeft</string>
+                  <string>UIInterfaceOrientationLandscapeRight</string>
+              </array>
+              <key>NSAppTransportSecurity</key>
+              <dict>
+                  <key>NSAllowsArbitraryLoads</key>
+                  <true/>
+              </dict>
+              <key>UIApplicationSceneManifest</key>
+              <dict>
+                  <key>UIApplicationSupportsMultipleScenes</key>
+                  <false/>
+              </dict>
+          </dict>
+          </plist>
+          PLIST_EOF
+
+          cat << 'ENT_EOF' > App/DuoSpaceMood.entitlements
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>com.apple.security.application-groups</key>
+              <array>
+                  <string>group.com.duospace.mood</string>
+              </array>
+          </dict>
+          </plist>
+          ENT_EOF
+
+      - name: Create Widget sources
+        run: |
+          mkdir -p Widget
+          cat << 'SWIFT_EOF' > Widget/MoodWidgetBundle.swift
+          import WidgetKit
+          import SwiftUI
+
+          @main
+          struct MoodWidgetBundle: WidgetBundle {
+              var body: some Widget {
+                  MoodWidget()
+              }
+          }
+          SWIFT_EOF
+
+          cat << 'SWIFT_EOF' > Widget/MoodWidgetProvider.swift
+          import WidgetKit
+          import SwiftUI
+
+          struct MoodWidgetProvider: TimelineProvider {
+              func placeholder(in context: Context) -> MoodWidgetEntry {
+                  MoodWidgetEntry(date: Date(), mood: nil, partnerName: "Partner")
+              }
+
+              func getSnapshot(in context: Context, completion: @escaping (MoodWidgetEntry) -> Void) {
+                  let cached = MoodFetcher.shared.getCachedMood()
+                  let entry = MoodWidgetEntry(
+                      date: Date(),
+                      mood: cached?.mood,
+                      partnerName: cached?.partner.name ?? "Partner"
+                  )
+                  completion(entry)
+              }
+
+              func getTimeline(in context: Context, completion: @escaping (Timeline<MoodWidgetEntry>) -> Void) {
+                  Task {
+                      let token = MoodFetcher.shared.getToken()
+                      let response = await MoodFetcher.shared.fetchMood(token: token)
+                      let entry = MoodWidgetEntry(
+                          date: Date(),
+                          mood: response?.mood,
+                          partnerName: response?.partner.name ?? "Partner"
+                      )
+                      let nextUpdate = Calendar.current.date(byAdding: .minute, value: 15, to: Date()) ?? Date()
+                      completion(Timeline(entries: [entry], policy: .after(nextUpdate)))
+                  }
+              }
+          }
+
+          struct MoodWidgetEntry: TimelineEntry {
+              let date: Date
+              let mood: MoodData?
+              let partnerName: String
+          }
+          SWIFT_EOF
+
+          cat << 'SWIFT_EOF' > Widget/MoodWidget.swift
+          import WidgetKit
+          import SwiftUI
+
+          struct MoodWidgetView: View {
+              let entry: MoodWidgetEntry
+
+              var body: some View {
+                  let bgColor = parseColor(entry.mood?.color, fallback: Color(red: 0.11, green: 0.098, blue: 0.09))
+
+                  ZStack {
+                      bgColor.ignoresSafeArea()
+                      VStack(spacing: 6) {
+                          Text(entry.partnerName.uppercased())
+                              .font(.system(size: 11, weight: .medium))
+                              .foregroundColor(Color.white.opacity(0.7))
+                              .tracking(0.5)
+
+                          if let mood = entry.mood {
+                              Text(mood.emoji)
+                                  .font(.system(size: 40))
+                              Text(mood.label)
+                                  .font(.system(size: 16, weight: .bold))
+                                  .foregroundColor(.white)
+                                  .lineLimit(1)
+
+                              if let note = mood.note, !note.isEmpty {
+                                  Text(note)
+                                      .font(.system(size: 12))
+                                      .foregroundColor(Color.white.opacity(0.8))
+                                      .lineLimit(2)
+                                      .multilineTextAlignment(.center)
+                                      .padding(.horizontal, 4)
+                              }
+
+                              if let timeAgo = mood.timeAgoString {
+                                  Text(timeAgo)
+                                      .font(.system(size: 11))
+                                      .foregroundColor(Color.white.opacity(0.6))
+                              }
+                          } else {
+                              Text("💭")
+                                  .font(.system(size: 40))
+                              Text("No mood yet")
+                                  .font(.system(size: 16, weight: .bold))
+                                  .foregroundColor(.white)
+                          }
+                      }
+                  }
+                  .widgetURL(URL(string: "https://nemo39.base44.app/mood-widget"))
+              }
+
+              private func parseColor(_ hex: String?, fallback: Color) -> Color {
+                  guard let hex = hex else { return fallback }
+                  let cleaned = hex.replacingOccurrences(of: "#", with: "")
+                  guard let value = UInt32(cleaned, radix: 16) else { return fallback }
+                  let r = Double((value >> 16) & 0xFF) / 255.0
+                  let g = Double((value >> 8) & 0xFF) / 255.0
+                  let b = Double(value & 0xFF) / 255.0
+                  return Color(red: r, green: g, blue: b)
+              }
+          }
+
+          struct MoodWidget: Widget {
+              let kind = "MoodWidget"
+
+              var body: some WidgetConfiguration {
+                  StaticConfiguration(kind: kind, provider: MoodWidgetProvider()) { entry in
+                      MoodWidgetView(entry: entry)
+                  }
+                  .configurationDisplayName("Partner Mood")
+                  .description("See your partner's current mood at a glance.")
+                  .supportedFamilies([.systemSmall, .systemMedium])
+              }
+          }
+          SWIFT_EOF
+
+          cat << 'PLIST_EOF' > Widget/Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleDevelopmentRegion</key>
+              <string>en</string>
+              <key>CFBundleDisplayName</key>
+              <string>M&amp;N Mood</string>
+              <key>CFBundleExecutable</key>
+              <string>$(EXECUTABLE_NAME)</string>
+              <key>CFBundleIdentifier</key>
+              <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+              <key>CFBundleInfoDictionaryVersion</key>
+              <string>6.0</string>
+              <key>CFBundleName</key>
+              <string>$(PRODUCT_NAME)</string>
+              <key>CFBundlePackageType</key>
+              <string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+              <key>CFBundleShortVersionString</key>
+              <string>1.0</string>
+              <key>CFBundleVersion</key>
+              <string>1</string>
+              <key>NSExtension</key>
+              <dict>
+                  <key>NSExtensionPointIdentifier</key>
+                  <string>com.apple.widgetkit-extension</string>
+              </dict>
+          </dict>
+          </plist>
+          PLIST_EOF
+
+          cat << 'ENT_EOF' > Widget/DuoSpaceMoodWidget.entitlements
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>com.apple.security.application-groups</key>
+              <array>
+                  <string>group.com.duospace.mood</string>
+              </array>
+          </dict>
+          </plist>
+          ENT_EOF
+
+      - name: Generate Xcode Project
+        run: xcodegen generate
+
+      # ──────────────────────────────────────────────────────────────
+      # UNSIGNED BUILD (default — no Apple Developer account needed)
+      # Sideload the resulting IPA via Sideloadly or AltStore, which
+      # sign it with your own Apple ID for free.
+      # ──────────────────────────────────────────────────────────────
+      - name: Build (unsigned)
+        run: |
+          xcodebuild \
+            -project DuoSpaceMood.xcodeproj \
+            -scheme DuoSpaceMood \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            -archivePath build/DuoSpaceMood.xcarchive \
+            archive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            DEVELOPMENT_TEAM=""
+
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p build/ipa/Payload
+          cp -r build/DuoSpaceMood.xcarchive/Products/Applications/DuoSpaceMood.app build/ipa/Payload/
+          cd build/ipa
+          zip -r DuoSpaceMood-unsigned.ipa Payload
+
+      # ──────────────────────────────────────────────────────────────
+      # SIGNED BUILD (optional — requires Apple Developer account)
+      # Uncomment these steps and add the secrets below to produce a
+      # signed, installable IPA that doesn't need sideloading tools.
+      #
+      # Required GitHub Secrets:
+      #   IOS_CERTIFICATE_P12             — base64 of your .p12 certificate
+      #   IOS_CERTIFICATE_PASSWORD        — password for the .p12
+      #   IOS_PROVISIONING_PROFILE_APP    — base64 of app .mobileprovision
+      #   IOS_PROVISIONING_PROFILE_WIDGET — base64 of widget .mobileprovision
+      #   IOS_TEAM_ID                      — your Apple Developer Team ID
+      # ──────────────────────────────────────────────────────────────
+      # - name: Import Code Signing Certificate
+      #   env:
+      #     IOS_CERTIFICATE_P12: ${{ secrets.IOS_CERTIFICATE_P12 }}
+      #     IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+      #   run: |
+      #     KEYCHAIN_PASSWORD=$(openssl rand -hex 16)
+      #     security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+      #     security default-keychain -s build.keychain
+      #     security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+      #     echo "$IOS_CERTIFICATE_P12" | base64 --decode > certificate.p12
+      #     security import certificate.p12 -k build.keychain -P "$IOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+      #     security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+      #
+      # - name: Import Provisioning Profiles
+      #   env:
+      #     IOS_PROVISIONING_PROFILE_APP: ${{ secrets.IOS_PROVISIONING_PROFILE_APP }}
+      #     IOS_PROVISIONING_PROFILE_WIDGET: ${{ secrets.IOS_PROVISIONING_PROFILE_WIDGET }}
+      #   run: |
+      #     mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+      #     echo "$IOS_PROVISIONING_PROFILE_APP" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/app.mobileprovision
+      #     echo "$IOS_PROVISIONING_PROFILE_WIDGET" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/widget.mobileprovision
+      #
+      # - name: Build and Export (signed)
+      #   env:
+      #     IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+      #   run: |
+      #     APP_UUID=$(security cms -D -i ~/Library/MobileDevice/Provisioning\ Profiles/app.mobileprovision | grep -A1 UUID | grep -io "[-A-F0-9]\{36\}")
+      #     WIDGET_UUID=$(security cms -D -i ~/Library/MobileDevice/Provisioning\ Profiles/widget.mobileprovision | grep -A1 UUID | grep -io "[-A-F0-9]\{36\}")
+      #
+      #     xcodebuild \
+      #       -project DuoSpaceMood.xcodeproj \
+      #       -scheme DuoSpaceMood \
+      #       -configuration Release \
+      #       -sdk iphoneos \
+      #       -derivedDataPath build \
+      #       -archivePath build/DuoSpaceMood.xcarchive \
+      #       archive \
+      #       CODE_SIGN_STYLE=Manual \
+      #       DEVELOPMENT_TEAM="$IOS_TEAM_ID" \
+      #       PROVISIONING_PROFILE_SPECIFIER_APP="$APP_UUID" \
+      #       PROVISIONING_PROFILE_SPECIFIER_WIDGET="$WIDGET_UUID"
+      #
+      #     cat > ExportOptions.plist << EOFPLIST
+      #     <?xml version="1.0" encoding="UTF-8"?>
+      #     <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+      #     <plist version="1.0">
+      #     <dict>
+      #         <key>method</key>
+      #         <string>ad-hoc</string>
+      #         <key>provisioningProfiles</key>
+      #         <dict>
+      #             <key>com.duospace.mood</key>
+      #             <dict>
+      #                 <key>identifier</key>
+      #                 <string>$APP_UUID</string>
+      #             </dict>
+      #             <key>com.duospace.mood.widget</key>
+      #             <dict>
+      #                 <key>identifier</key>
+      #                 <string>$WIDGET_UUID</string>
+      #             </dict>
+      #         </dict>
+      #     </dict>
+      #     </plist>
+      #     EOFPLIST
+      #
+      #     xcodebuild -exportArchive \
+      #       -archivePath build/DuoSpaceMood.xcarchive \
+      #       -exportOptionsPlist ExportOptions.plist \
+      #       -exportPath build/ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DuoSpaceMood-IPA
+          path: build/ipa/*.ipa
